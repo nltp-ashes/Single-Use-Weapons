@@ -1,0 +1,183 @@
+---==================================================================================================================---
+---                                                                                                                  ---
+---    Original Author(s) : NLTP_ASHES                                                                               ---
+---    Edited : N/A                                                                                                  ---
+---    Date : 08/10/2026                                                                                             ---
+---    License : Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)           ---
+---                                                                                                                  ---
+---    Script used to discard single use weapons (e.g. disposable rocket launchers) once they have been fired.       ---
+---                                                                                                                  ---
+---    A weapon is single use when its section defines "single_use = true". Its ammo section must define             ---
+---    "fake_ammo = true", which prevents the weapon from being unloaded or reloaded. Since the engine always        ---
+---    spawns weapons with a full magazine, an empty single use weapon is necessarily a spent one.                   ---
+---                                                                                                                  ---
+---    Once spent, the weapon plays the "anm_discard" animation of its HUD section (and the optional "snd_discard"   ---
+---    sound of its section), then gets released. If the HUD section doesn't define the animation, the weapon is     ---
+---    holstered instead, and released at the end of the holster.                                                    ---
+---                                                                                                                  ---
+---    If the weapon section defines "discard_object" (a physic_object section, which can't be picked up), it gets   ---
+---    dropped in front of the actor upon release. Only the last few are kept in the world, older ones are released. ---
+---                                                                                                                  ---
+---==================================================================================================================---
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- Constants, global variables and imported functions
+-- ---------------------------------------------------------------------------------------------------------------------
+
+local STATE_IDLE = 0                -- CHUDState::eIdle
+local STATE_HIDING = 2              -- CHUDState::eHiding
+local STATE_DISCARD = 1000          -- Custom state to tag the discard animation, so that its end is recognizable
+
+local PH_FLAG_ACTIVE = 1            -- CSE_PHSkeleton::flActive
+
+local ANM_DISCARD = "anm_discard"   -- HUD animation played to get rid of a spent weapon (HUD section)
+local SND_DISCARD = "snd_discard"   -- Sound played along with the discard animation (weapon section, optional)
+
+local DISCARD_DISTANCE = 0.5        -- Horizontal distance from the actor at which discarded objects are dropped (meters)
+local DISCARD_HEIGHT = 1.0          -- Height above the actor's feet at which discarded objects are dropped (meters)
+local DISCARD_LIMIT = 10            -- Amount of discarded objects kept in the world, older ones get released
+
+local discarded = {}                -- Discarded objects, oldest first, as { id = number, section = string } (saved)
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- General functions
+-- ---------------------------------------------------------------------------------------------------------------------
+
+--- Function used to know if a weapon section is single use.
+--- @param section string section of the weapon
+--- @return boolean
+function is_single_use(section)
+    return ini_sys:r_bool_ex(section, "single_use", false)
+end
+
+--- Function used to know if an item is a single use weapon that has already been fired.
+--- @param obj game_object item to check
+--- @return boolean
+function is_spent(obj)
+    return IsWeapon(obj) and is_single_use(obj:section()) and obj:get_ammo_in_magazine() == 0
+end
+
+--- Function used to know if a HUD section defines a discard animation.
+--- @param hud_section string HUD section of the weapon
+--- @return boolean
+function has_discard_anim(hud_section)
+    return ini_sys:r_string_ex(hud_section, ANM_DISCARD) ~= nil
+end
+
+--- Function used to release a discarded object, if it still exists.
+--- The section check protects against the id having been reused by another object since.
+--- @param entry table discarded object, as { id = number, section = string }
+--- @return nil
+function release_discarded(entry)
+    local se_obj = alife_object(entry.id)
+    if se_obj and se_obj:section_name() == entry.section then
+        alife_release(se_obj)
+    end
+end
+
+--- Function used to drop the discarded object of a weapon in front of the actor, if the weapon defines one.
+--- @param section string section of the weapon
+--- @return nil
+function drop_discarded(section)
+    local discard_section = ini_sys:r_string_ex(section, "discard_object")
+    if not discard_section then
+        return
+    end
+
+    local pos = db.actor:position():add(vector():setHP(device().cam_dir:getH(), 0):mul(DISCARD_DISTANCE))
+    pos.y = pos.y + DISCARD_HEIGHT
+
+    local se_obj = alife_create(discard_section, pos, db.actor:level_vertex_id(), db.actor:game_vertex_id())
+    if not se_obj then
+        return
+    end
+    se_obj.angle = vector():set(0, math.random() * 2 * math.pi, 0)
+
+    -- Physic objects build their physics shell asleep unless flagged active, which would leave this one floating
+    local data = utils_stpk.get_physic_data(se_obj)
+    data.skeleton_flags = bit.bor(data.skeleton_flags, PH_FLAG_ACTIVE)
+    utils_stpk.set_physic_data(data, se_obj)
+
+    table.insert(discarded, { id = se_obj.id, section = discard_section })
+    if #discarded > DISCARD_LIMIT then
+        release_discarded(table.remove(discarded, 1))
+    end
+end
+
+--- Function used to replace the idle animations of spent single use weapons by their discard animation.
+--- Hooking the idle (instead of playing the discard animation directly) is required, because weapon state switches are
+--- processed asynchronously by the engine: a motion started from a callback would be overridden by the pending idle.
+--- @param anm_table table animation parameters (anm_name, anm_mixin, anm_mixin2, anm_state, anm_speed, anm_end)
+--- @param obj game_object item playing the animation
+--- @return nil
+function actor_on_hud_animation_play(anm_table, obj)
+    if not (obj and anm_table.anm_state == STATE_IDLE and is_spent(obj)) then
+        return
+    end
+
+    local hud_sec = ini_sys:r_string_ex(obj:section(), "hud")
+    if not (hud_sec and has_discard_anim(hud_sec)) then
+        return
+    end
+
+    anm_table.anm_name = ANM_DISCARD
+    anm_table.anm_state = STATE_DISCARD
+    anm_table.anm_speed = 1
+    anm_table.anm_end = 0
+
+    utils_obj.play_sound(ini_sys:r_string_ex(obj:section(), SND_DISCARD))
+end
+
+--- Function used to get rid of spent single use weapons held by the actor.
+--- Without a discard animation, the weapon is holstered, and the end of the holster releases the item.
+--- If the animation gets interrupted (e.g. by aiming), it starts again once the interrupting animation ends.
+--- Being stateless, this also catches spent weapons obtained by other means (e.g. looted from an NPC).
+--- @param item game_object item whose HUD animation ended
+--- @param section string HUD section of the item
+--- @param motion string name of the motion that ended
+--- @param state number HUD state of the item when the motion started
+--- @param slot number animation slot of the item
+--- @return nil
+function actor_on_hud_animation_end(item, section, motion, state, slot)
+    if not (item and is_spent(item)) then
+        return
+    end
+
+    if state == STATE_HIDING or state == STATE_DISCARD then
+        drop_discarded(item:section())
+        alife_release_id(item:id())
+    elseif not has_discard_anim(section) then
+        db.actor:activate_slot(0)
+    end
+end
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- Data persistence
+-- ---------------------------------------------------------------------------------------------------------------------
+
+--- Function used to save the discarded objects.
+--- @param m_data table save data
+--- @return nil
+function save_state(m_data)
+    m_data.single_use_weapons_discarded = discarded
+end
+
+--- Function used to load the discarded objects.
+--- @param m_data table save data
+--- @return nil
+function load_state(m_data)
+    discarded = m_data.single_use_weapons_discarded or {}
+end
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- Callbacks registration
+-- ---------------------------------------------------------------------------------------------------------------------
+
+--- Function used to register callbacks.
+--- @return nil
+function on_game_start()
+    RegisterScriptCallback("actor_on_hud_animation_play", actor_on_hud_animation_play)
+    RegisterScriptCallback("actor_on_hud_animation_end", actor_on_hud_animation_end)
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+end
