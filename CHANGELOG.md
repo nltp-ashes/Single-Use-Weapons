@@ -1,8 +1,6 @@
-## **v1.0.0 - 08/10/2026 - Initial Release**
+## **v1.1.0 - 09/10/2026 - Minor Update**
 
-[![Downloads](https://img.shields.io/github/downloads/nltp-ashes/Single-Use-Weapons/v1.0.0/total?label=Downloads)]()
+[![Downloads](https://img.shields.io/github/downloads/nltp-ashes/Single-Use-Weapons/v1.1.0/total?label=Downloads)]()
 
-**• Additions :**
-> - Added support for single use weapons, enabled with `single_use = true` in the weapon section;
-> - Added an optional discard animation (`anm_discard`) and sound (`snd_discard`), played after firing a single use weapon;
-> - Added an optional spent model (`discard_object`), dropped on the ground after discarding a single use weapon;
+**• Changes :**
+> - The physics object of the discarded weapon now spawns where the discard (or holster) HUD animation left it;
